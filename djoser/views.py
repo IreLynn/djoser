@@ -140,7 +140,7 @@ class PasswordResetView(utils.ActionViewMixin, generics.GenericAPIView):
                 email_field_name + '__iexact': email
             })
             self._users = [
-                u for u in users if u.is_active and u.has_usable_password()
+                u for u in users if u.is_active
             ]
         return self._users
 
