@@ -121,7 +121,7 @@ class PasswordResetView(utils.ActionViewMixin, utils.SendEmailViewMixin, generic
             email__iexact=email,
             is_active=True,
         )
-        return (u for u in active_users if u.has_usable_password())
+        return (u for u in active_users)
 
     def get_email_context(self, user):
         context = super(PasswordResetView, self).get_email_context(user)
