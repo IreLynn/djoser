@@ -1,10 +1,14 @@
-from django.contrib.auth import get_user_model, user_logged_in, user_logged_out
-from rest_framework import generics, permissions, status, response, views
-from rest_framework.authtoken.models import Token
+from django.contrib.auth import get_user_model
+from django.contrib.auth.tokens import default_token_generator
+from django.urls.exceptions import NoReverseMatch
+
+from rest_framework import generics, permissions, status, views
 from rest_framework.response import Response
 from rest_framework.reverse import reverse
-from django.contrib.auth.tokens import default_token_generator
-from . import serializers, settings, utils, signals
+
+from djoser import utils, signals
+from djoser.compat import get_user_email, get_user_email_field_name
+from djoser.conf import settings
 
 User = get_user_model()
 
@@ -13,197 +17,227 @@ class RootView(views.APIView):
     """
     Root endpoint - use one of sub endpoints.
     """
-    permission_classes = (
-        permissions.AllowAny,
-    )
-    urls_mapping = {
-        'me': 'user',
-        'register': 'register',
-        'activate': 'activate',
-        'change-' + User.USERNAME_FIELD: 'set_username',
-        'change-password': 'set_password',
-        'password-reset': 'password_reset',
-        'password-reset-confirm': 'password_reset_confirm',
-    }
-    urls_extra_mapping = None
+    permission_classes = [permissions.AllowAny]
 
-    def get_urls_mapping(self, **kwargs):
-        mapping = self.urls_mapping.copy()
-        mapping.update(kwargs)
-        if self.urls_extra_mapping:
-            mapping.update(self.urls_extra_mapping)
-        mapping.update(settings.get('ROOT_VIEW_URLS_MAPPING'))
-        return mapping
+    def aggregate_djoser_urlpattern_names(self):
+        from djoser.urls import base, authtoken
+        urlpattern_names = [pattern.name for pattern in base.urlpatterns]
+        urlpattern_names += [pattern.name for pattern in authtoken.urlpatterns]
+        urlpattern_names += self._get_jwt_urlpatterns()
 
-    def get(self, request, format=None):
-        return Response(
-            dict([(key, reverse(url_name, request=request, format=format))
-                  for key, url_name in self.get_urls_mapping().items()])
-        )
+        return urlpattern_names
+
+    def get_urls_map(self, request, urlpattern_names, fmt):
+        urls_map = {}
+        for urlpattern_name in urlpattern_names:
+            try:
+                url = reverse(urlpattern_name, request=request, format=fmt)
+            except NoReverseMatch:
+                url = ''
+            urls_map[urlpattern_name] = url
+        return urls_map
+
+    def get(self, request, fmt=None):
+        urlpattern_names = self.aggregate_djoser_urlpattern_names()
+        urls_map = self.get_urls_map(request, urlpattern_names, fmt)
+        return Response(urls_map)
+
+    def _get_jwt_urlpatterns(self):
+        try:
+            from djoser.urls import jwt
+            return [pattern.name for pattern in jwt.urlpatterns]
+        except ImportError:
+            return []
 
 
-class RegistrationView(utils.SendEmailViewMixin, generics.CreateAPIView):
+class UserCreateView(generics.CreateAPIView):
     """
     Use this endpoint to register new user.
     """
-    serializer_class = serializers.UserRegistrationSerializer
-    permission_classes = (
-        permissions.AllowAny,
-    )
-    token_generator = default_token_generator
-    subject_template_name = 'activation_email_subject.txt'
-    plain_body_template_name = 'activation_email_body.txt'
+    serializer_class = settings.SERIALIZERS.user_create
+    permission_classes = [permissions.AllowAny]
 
     def perform_create(self, serializer):
-        instance = serializer.save()
-        signals.user_registered.send(sender=self.__class__, user=instance, request=self.request)
-        if settings.get('SEND_ACTIVATION_EMAIL'):
-            self.send_email(**self.get_send_email_kwargs(instance))
+        user = serializer.save()
+        signals.user_registered.send(
+            sender=self.__class__, user=user, request=self.request
+        )
 
-    def get_email_context(self, user):
-        context = super(RegistrationView, self).get_email_context(user)
-        context['url'] = settings.get('ACTIVATION_URL').format(**context)
-        return context
+        context = {'user': user}
+        to = [get_user_email(user)]
+        if settings.SEND_ACTIVATION_EMAIL:
+            settings.EMAIL.activation(self.request, context).send(to)
+        elif settings.SEND_CONFIRMATION_EMAIL:
+            settings.EMAIL.confirmation(self.request, context).send(to)
 
 
-class LoginView(utils.ActionViewMixin, generics.GenericAPIView):
+class UserDeleteView(generics.CreateAPIView):
+    """
+    Use this endpoint to remove actually authenticated user
+    """
+    serializer_class = settings.SERIALIZERS.user_delete
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_object(self):
+        return self.request.user
+
+    def post(self, request, *args, **kwargs):
+        instance = self.get_object()
+        serializer = self.get_serializer(instance, data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        utils.logout_user(self.request)
+        instance.delete()
+
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class TokenCreateView(utils.ActionViewMixin, generics.GenericAPIView):
     """
     Use this endpoint to obtain user authentication token.
     """
-    serializer_class = serializers.LoginSerializer
-    permission_classes = (
-        permissions.AllowAny,
-    )
+    serializer_class = settings.SERIALIZERS.token_create
+    permission_classes = [permissions.AllowAny]
 
-    def action(self, serializer):
-        user = serializer.user
-        token, _ = Token.objects.get_or_create(user=user)
-        user_logged_in.send(sender=user.__class__, request=self.request, user=user)
+    def _action(self, serializer):
+        token = utils.login_user(self.request, serializer.user)
+        token_serializer_class = settings.SERIALIZERS.token
         return Response(
-            data=serializers.TokenSerializer(token).data,
+            data=token_serializer_class(token).data,
             status=status.HTTP_200_OK,
         )
 
 
-class LogoutView(views.APIView):
+class TokenDestroyView(views.APIView):
     """
     Use this endpoint to logout user (remove user authentication token).
     """
-    permission_classes = (
-        permissions.IsAuthenticated,
-    )
+    permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request):
-        Token.objects.filter(user=request.user).delete()
-        user_logged_out.send(sender=request.user.__class__, request=request, user=request.user)
-        return response.Response(status=status.HTTP_200_OK)
+        utils.logout_user(request)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
-class PasswordResetView(utils.ActionViewMixin, utils.SendEmailViewMixin, generics.GenericAPIView):
+class PasswordResetView(utils.ActionViewMixin, generics.GenericAPIView):
     """
     Use this endpoint to send email to user with password reset link.
     """
-    serializer_class = serializers.PasswordResetSerializer
-    permission_classes = (
-        permissions.AllowAny,
-    )
-    token_generator = default_token_generator
-    subject_template_name = 'password_reset_email_subject.txt'
-    plain_body_template_name = 'password_reset_email_body.txt'
+    serializer_class = settings.SERIALIZERS.password_reset
+    permission_classes = [permissions.AllowAny]
 
-    def action(self, serializer):
+    _users = None
+
+    def _action(self, serializer):
         for user in self.get_users(serializer.data['email']):
-            self.send_email(**self.get_send_email_kwargs(user))
-        return response.Response(status=status.HTTP_200_OK)
+            self.send_password_reset_email(user)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     def get_users(self, email):
-        active_users = User._default_manager.filter(
-            email__iexact=email,
-            is_active=True,
-        )
-        return (u for u in active_users)
+        if self._users is None:
+            email_field_name = get_user_email_field_name(User)
+            users = User._default_manager.filter(**{
+                email_field_name + '__iexact': email
+            })
+            self._users = [
+                u for u in users if u.is_active
+            ]
+        return self._users
 
-    def get_email_context(self, user):
-        context = super(PasswordResetView, self).get_email_context(user)
-        context['url'] = settings.get('PASSWORD_RESET_CONFIRM_URL').format(**context)
-        return context
+    def send_password_reset_email(self, user):
+        context = {'user': user}
+        to = [get_user_email(user)]
+        settings.EMAIL.password_reset(self.request, context).send(to)
 
 
 class SetPasswordView(utils.ActionViewMixin, generics.GenericAPIView):
     """
     Use this endpoint to change user password.
     """
-    permission_classes = (
-        permissions.IsAuthenticated,
-    )
+    permission_classes = [permissions.IsAuthenticated]
 
     def get_serializer_class(self):
-        if settings.get('SET_PASSWORD_RETYPE'):
-            return serializers.SetPasswordRetypeSerializer
-        return serializers.SetPasswordSerializer
+        if settings.SET_PASSWORD_RETYPE:
+            return settings.SERIALIZERS.set_password_retype
+        return settings.SERIALIZERS.set_password
 
-    def action(self, serializer):
+    def _action(self, serializer):
         self.request.user.set_password(serializer.data['new_password'])
         self.request.user.save()
-        return response.Response(status=status.HTTP_200_OK)
+
+        if settings.LOGOUT_ON_PASSWORD_CHANGE:
+            utils.logout_user(self.request)
+
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class PasswordResetConfirmView(utils.ActionViewMixin, generics.GenericAPIView):
     """
     Use this endpoint to finish reset password process.
     """
-    permission_classes = (
-        permissions.AllowAny,
-    )
+    permission_classes = [permissions.AllowAny]
     token_generator = default_token_generator
 
     def get_serializer_class(self):
-        if settings.get('PASSWORD_RESET_CONFIRM_RETYPE'):
-            return serializers.PasswordResetConfirmRetypeSerializer
-        return serializers.PasswordResetConfirmSerializer
+        if settings.PASSWORD_RESET_CONFIRM_RETYPE:
+            return settings.SERIALIZERS.password_reset_confirm_retype
+        return settings.SERIALIZERS.password_reset_confirm
 
-    def action(self, serializer):
+    def _action(self, serializer):
         serializer.user.set_password(serializer.data['new_password'])
         serializer.user.save()
-        return response.Response(status=status.HTTP_200_OK)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class ActivationView(utils.ActionViewMixin, generics.GenericAPIView):
     """
     Use this endpoint to activate user account.
     """
-    serializer_class = serializers.UidAndTokenSerializer
-    permission_classes = (
-        permissions.AllowAny,
-    )
+    serializer_class = settings.SERIALIZERS.activation
+    permission_classes = [permissions.AllowAny]
     token_generator = default_token_generator
 
-    def action(self, serializer):
-        serializer.user.is_active = True
-        serializer.user.save()
+    def _action(self, serializer):
+        user = serializer.user
+        user.is_active = True
+        user.save()
+
         signals.user_activated.send(
-            sender=self.__class__, user=serializer.user, request=self.request)
-        return Response(status=status.HTTP_200_OK)
+            sender=self.__class__, user=user, request=self.request
+        )
+
+        if settings.SEND_CONFIRMATION_EMAIL:
+            context = {'user': user}
+            to = [get_user_email(user)]
+            settings.EMAIL.confirmation(self.request, context).send(to)
+
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class SetUsernameView(utils.ActionViewMixin, generics.GenericAPIView):
     """
     Use this endpoint to change user username.
     """
-    serializer_class = serializers.SetUsernameSerializer
-    permission_classes = (
-        permissions.IsAuthenticated,
-    )
+    permission_classes = [permissions.IsAuthenticated]
 
     def get_serializer_class(self):
-        if settings.get('SET_USERNAME_RETYPE'):
-            return serializers.SetUsernameRetypeSerializer
-        return serializers.SetUsernameSerializer
+        if settings.SET_USERNAME_RETYPE:
+            return settings.SERIALIZERS.set_username_retype
+        return settings.SERIALIZERS.set_username
 
-    def action(self, serializer):
-        setattr(self.request.user, User.USERNAME_FIELD, serializer.data['new_' + User.USERNAME_FIELD])
-        self.request.user.save()
-        return response.Response(status=status.HTTP_200_OK)
+    def _action(self, serializer):
+        user = self.request.user
+        new_username = serializer.data['new_' + User.USERNAME_FIELD]
+
+        setattr(user, User.USERNAME_FIELD, new_username)
+        if settings.SEND_ACTIVATION_EMAIL:
+            user.is_active = False
+            context = {'user': user}
+            to = [get_user_email(user)]
+            settings.EMAIL.activation(self.request, context).send(to)
+        user.save()
+
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class UserView(generics.RetrieveUpdateAPIView):
@@ -211,10 +245,16 @@ class UserView(generics.RetrieveUpdateAPIView):
     Use this endpoint to retrieve/update user.
     """
     model = User
-    serializer_class = serializers.UserSerializer
-    permission_classes = (
-        permissions.IsAuthenticated,
-    )
+    serializer_class = settings.SERIALIZERS.user
+    permission_classes = [permissions.IsAuthenticated]
 
     def get_object(self, *args, **kwargs):
         return self.request.user
+
+    def perform_update(self, serializer):
+        super(UserView, self).perform_update(serializer)
+        user = serializer.instance
+        if settings.SEND_ACTIVATION_EMAIL and not user.is_active:
+            context = {'user': user}
+            to = [get_user_email(user)]
+            settings.EMAIL.activation(self.request, context).send(to)

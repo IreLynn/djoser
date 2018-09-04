@@ -1,39 +1,42 @@
-language: python
+sudo: false
 
+language: python
 python:
-  - "2.6"
   - "2.7"
   - "3.4"
   - "3.5"
 
 env:
-  - DJANGO_VERSION=1.5.12 DRF_VERSION=3.2.4
-  - DJANGO_VERSION=1.6.11 DRF_VERSION=3.2.4
-  - DJANGO_VERSION=1.7.10 DRF_VERSION=3.2.4
-  - DJANGO_VERSION=1.8.4 DRF_VERSION=3.2.4
+  - DJANGO=1.10
+  - DJANGO=1.11
+  - DJANGO=master
 
 matrix:
+  fast_finish: true
+  include:
+    - python: "3.6"
+      env: DJANGO=1.11
+    - python: "3.6"
+      env: DJANGO=master
+    - python: "3.7-dev"
+      env: DJANGO=1.11
+    - python: "3.7-dev"
+      env: DJANGO=master
   exclude:
-    # Django 1.7 and 1.8 dropped support for Python 2.6.
-    - python: "2.6"
-      env: DJANGO_VERSION=1.7.10 DRF_VERSION=3.2.4
-    - python: "2.6"
-      env: DJANGO_VERSION=1.8.4 DRF_VERSION=3.2.4
-    # Only Django 1.8+ supports Python 3.5
-    - python: "3.5"
-      env: DJANGO_VERSION=1.5.12 DRF_VERSION=3.2.4
-    - python: "3.5"
-      env: DJANGO_VERSION=1.6.11 DRF_VERSION=3.2.4
-    - python: "3.5"
-      env: DJANGO_VERSION=1.7.10 DRF_VERSION=3.2.4
+    - python: "2.7"
+      env: DJANGO=master
+    - python: "3.4"
+      env: DJANGO=master
+  allow_failures:
+    - python: "3.7-dev"
+    - env: DJANGO=master
 
 install:
-  - pip install -q Django==$DJANGO_VERSION
-  - pip install -q djangorestframework==$DRF_VERSION
-  - pip install -q djet==0.0.10
-  - pip install coveralls
-  - python setup.py -q develop
+  - travis_retry pip install -U tox-travis
 
-script: coverage run --source=djoser testproject/manage.py test testapp
+script:
+  - tox
+
 after_success:
-  coveralls
+  - travis_retry pip install -U codecov
+  - codecov
