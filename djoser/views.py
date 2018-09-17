@@ -189,6 +189,37 @@ class PasswordResetConfirmView(utils.ActionViewMixin, generics.GenericAPIView):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
+class ActivationResendView(utils.ActionViewMixin, generics.GenericAPIView):
+    """
+    Use this endpoint to resend email to user with account activation link.
+    """
+    serializer_class = settings.SERIALIZERS.password_reset
+    permission_classes = [permissions.AllowAny]
+
+    _users = None
+
+    def _action(self, serializer):
+        for user in self.get_users(serializer.data['email']):
+            self.send_activation_email(user)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    def get_users(self, email):
+        if self._users is None:
+            email_field_name = get_user_email_field_name(User)
+            users = User._default_manager.filter(**{
+                email_field_name + '__iexact': email
+            })
+            self._users = [
+                u for u in users
+            ]
+        return self._users
+
+    def send_activation_email(self, user):
+        context = {'user':user}
+        to = [get_user_email(user)]
+        settings.EMAIL.activation(self.request, context).send(to)
+
+
 class ActivationView(utils.ActionViewMixin, generics.GenericAPIView):
     """
     Use this endpoint to activate user account.

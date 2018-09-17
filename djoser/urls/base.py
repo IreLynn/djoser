@@ -39,5 +39,10 @@ urlpatterns = [
         views.PasswordResetConfirmView.as_view(),
         name='password_reset_confirm'
     ),
+    url(
+        r'^activation/resend/$',
+        views.ActivationResendView.as_view(),
+        name= 'activation_resend'
+    ),
     url(r'^$', views.RootView.as_view(), name='root'),
 ]
